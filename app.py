@@ -7,10 +7,16 @@ import re
 
 app = Flask(__name__)
 
-TIMEOUT = 15
-MAX_BYTES = 8 * 1024 * 1024
-USER_AGENT = "VercelWebProxy/1.0"
+TIMEOUT = 20
+MAX_BYTES = 12 * 1024 * 1024
 
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+
+# Headers that should NOT be copied from the destination server.
 HOP_BY_HOP = {
     "connection",
     "keep-alive",
@@ -26,7 +32,10 @@ HOP_BY_HOP = {
 
 
 def is_public_host(host):
-    """Prevent requests to localhost/private/internal addresses."""
+    """
+    Prevent the proxy from connecting to private/local addresses.
+    """
+
     if not host:
         return False
 
@@ -56,8 +65,9 @@ def normalize_url(url):
     url = (url or "").strip()
 
     if not url:
-        raise ValueError("Missing URL.")
+        raise ValueError("No URL was provided.")
 
+    # Allow users to type example.com instead of https://example.com
     if not re.match(r"^https?://", url, re.IGNORECASE):
         url = "https://" + url
 
@@ -75,31 +85,34 @@ def normalize_url(url):
     return url
 
 
-def proxy_url(target):
-    return "/proxy?url=" + quote(target, safe="")
+def proxy_url(url):
+    return "/proxy?url=" + quote(url, safe="")
 
 
 def rewrite_html(html, base_url):
     """
-    Rewrite common HTML URLs so navigation remains inside
-    the Vercel proxy instead of going directly to the target.
+    Rewrite common URLs in HTML so they continue going through
+    the Vercel proxy.
     """
 
-    attribute_pattern = re.compile(
-        r'(?P<prefix>\b(?:href|src|action|poster|cite|data-src)\s*=\s*)'
+    pattern = re.compile(
+        r'(?P<prefix>\b'
+        r'(?:href|src|action|poster|cite|data-src|data-href)'
+        r'\s*=\s*)'
         r'(?P<quote>["\'])'
         r'(?P<url>.*?)'
         r'(?P=quote)',
         re.IGNORECASE | re.DOTALL,
     )
 
-    def replace_attribute(match):
-        raw_url = match.group("url").strip()
+    def replace(match):
+        original = match.group("url").strip()
 
-        if not raw_url:
+        if not original:
             return match.group(0)
 
-        if raw_url.startswith(
+        # Don't mess with anchors, JavaScript, data URLs, etc.
+        if original.startswith(
             (
                 "#",
                 "javascript:",
@@ -110,58 +123,63 @@ def rewrite_html(html, base_url):
         ):
             return match.group(0)
 
-        absolute_url = urljoin(base_url, raw_url)
+        absolute = urljoin(base_url, original)
 
         try:
-            absolute_url = normalize_url(absolute_url)
+            absolute = normalize_url(absolute)
         except ValueError:
             return match.group(0)
 
         return (
             match.group("prefix")
             + match.group("quote")
-            + proxy_url(absolute_url)
+            + proxy_url(absolute)
             + match.group("quote")
         )
 
-    html = attribute_pattern.sub(replace_attribute, html)
+    html = pattern.sub(replace, html)
 
-    # Rewrite CSS url(...) references.
-    def replace_css_url(match):
-        raw_url = match.group(2).strip()
+    # Rewrite CSS url(...)
+    def replace_css(match):
+        original = match.group(2).strip()
 
-        if raw_url.startswith(("data:", "#")):
+        if not original:
             return match.group(0)
 
-        absolute_url = urljoin(base_url, raw_url)
+        if original.startswith(("data:", "#")):
+            return match.group(0)
+
+        absolute = urljoin(base_url, original)
 
         try:
-            absolute_url = normalize_url(absolute_url)
+            absolute = normalize_url(absolute)
         except ValueError:
             return match.group(0)
 
-        return "url('" + proxy_url(absolute_url) + "')"
+        return "url('" + proxy_url(absolute) + "')"
 
     html = re.sub(
         r"url\(\s*(['\"]?)(.*?)\1\s*\)",
-        replace_css_url,
+        replace_css,
         html,
         flags=re.IGNORECASE,
     )
 
-    # Rewrite <base href="...">.
+    # Rewrite <base href>
     def replace_base(match):
-        absolute_url = urljoin(base_url, match.group(3))
+        original = match.group(3)
+
+        absolute = urljoin(base_url, original)
 
         try:
-            absolute_url = normalize_url(absolute_url)
+            absolute = normalize_url(absolute)
         except ValueError:
             return match.group(0)
 
         return (
             match.group(1)
             + match.group(2)
-            + proxy_url(absolute_url)
+            + proxy_url(absolute)
             + match.group(2)
         )
 
@@ -172,7 +190,7 @@ def rewrite_html(html, base_url):
         flags=re.IGNORECASE | re.DOTALL,
     )
 
-    # Small JavaScript bridge for window.open().
+    # Inject a small JavaScript bridge.
     bridge = f"""
 <script>
 window.__PROXY_BASE__ = {base_url!r};
@@ -181,7 +199,7 @@ window.__PROXY_PREFIX__ = "/proxy?url=";
 (function () {{
     const originalOpen = window.open;
 
-    window.open = function (url, target, features) {{
+    window.open = function(url, target, features) {{
         try {{
             if (
                 url &&
@@ -196,9 +214,7 @@ window.__PROXY_PREFIX__ = "/proxy?url=";
                     window.__PROXY_PREFIX__ +
                     encodeURIComponent(absolute);
             }}
-        }} catch (error) {{
-            // Leave the URL unchanged if it cannot be parsed.
-        }}
+        }} catch (e) {{}}
 
         return originalOpen.call(
             window,
@@ -232,8 +248,11 @@ def index():
 
 @app.route("/proxy", methods=["GET", "POST"])
 def proxy():
+
     try:
-        target = normalize_url(request.args.get("url", ""))
+        target = normalize_url(
+            request.args.get("url", "")
+        )
 
     except ValueError as error:
         return (
@@ -245,6 +264,7 @@ def proxy():
         )
 
     try:
+
         headers = {
             "User-Agent": USER_AGENT,
             "Accept": request.headers.get(
@@ -253,44 +273,62 @@ def proxy():
             ),
             "Accept-Language": request.headers.get(
                 "Accept-Language",
-                "en-US,en;q=0.8",
+                "en-US,en;q=0.9",
             ),
+            # IMPORTANT:
+            # Don't ask the destination to gzip/brotli the
+            # response. This makes proxying much simpler.
+            "Accept-Encoding": "identity",
         }
 
+        # Forward a few useful browser headers.
         if request.headers.get("Referer"):
             headers["Referer"] = request.headers["Referer"]
 
-        body = (
-            request.get_data()
-            if request.method == "POST"
-            else None
-        )
+        if request.headers.get("Content-Type"):
+            headers["Content-Type"] = request.headers["Content-Type"]
 
-        response = requests.request(
+        request_body = None
+
+        if request.method == "POST":
+            request_body = request.get_data()
+
+        upstream = requests.request(
             method=request.method,
             url=target,
             headers=headers,
-            data=body,
+            data=request_body,
             timeout=TIMEOUT,
             allow_redirects=True,
-            stream=True,
+            stream=False,
         )
 
-        content_type = response.headers.get(
+        content_type = upstream.headers.get(
             "Content-Type",
             "",
         )
 
-        body = response.raw.read(
-            MAX_BYTES + 1
-        )
+        # requests has already decompressed the response if
+        # the server ignored Accept-Encoding: identity and
+        # returned compression anyway.
+        body = upstream.content
 
         if len(body) > MAX_BYTES:
-            return "Response too large.", 413
+            return (
+                "The destination response is too large.",
+                413,
+            )
 
-        # HTML gets rewritten so links stay inside the proxy.
+        # -------------------------
+        # HTML
+        # -------------------------
+
         if "text/html" in content_type.lower():
-            encoding = response.encoding or "utf-8"
+
+            encoding = (
+                upstream.encoding
+                or "utf-8"
+            )
 
             html = body.decode(
                 encoding,
@@ -299,41 +337,67 @@ def proxy():
 
             html = rewrite_html(
                 html,
-                response.url,
+                upstream.url,
             )
 
             body = html.encode("utf-8")
 
-            content_type = "text/html; charset=utf-8"
+            content_type = (
+                "text/html; charset=utf-8"
+            )
+
+        # -------------------------
+        # Response headers
+        # -------------------------
 
         output_headers = {}
 
-        for key, value in response.headers.items():
-            if key.lower() in HOP_BY_HOP:
+        for key, value in upstream.headers.items():
+
+            key_lower = key.lower()
+
+            if key_lower in HOP_BY_HOP:
                 continue
 
-            if key.lower() == "location":
+            if key_lower == "location":
+                continue
+
+            # These can interfere with displaying proxied
+            # pages inside our domain.
+            if key_lower in {
+                "content-security-policy",
+                "content-security-policy-report-only",
+                "x-frame-options",
+            }:
                 continue
 
             output_headers[key] = value
 
-        # Keep redirects inside the Vercel domain.
+        # Set the correct content type after rewriting HTML.
+        output_headers["Content-Type"] = content_type
+
+        # -------------------------
+        # Redirects
+        # -------------------------
+
         if (
-            300 <= response.status_code < 400
-            and response.headers.get("Location")
+            300 <= upstream.status_code < 400
+            and upstream.headers.get("Location")
         ):
+
             destination = urljoin(
-                response.url,
-                response.headers["Location"],
+                upstream.url,
+                upstream.headers["Location"],
             )
 
             try:
+
                 destination = normalize_url(
                     destination
                 )
 
-                output_headers["Location"] = proxy_url(
-                    destination
+                output_headers["Location"] = (
+                    proxy_url(destination)
                 )
 
             except ValueError:
@@ -341,15 +405,19 @@ def proxy():
 
         return Response(
             body,
-            status=response.status_code,
+            status=upstream.status_code,
             headers=output_headers,
         )
 
     except requests.RequestException as error:
+
         return (
             render_template(
                 "error.html",
-                message=f"Could not fetch that site: {error}",
+                message=(
+                    "The proxy could not fetch that page: "
+                    + str(error)
+                ),
             ),
             502,
         )
