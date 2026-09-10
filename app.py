@@ -16,8 +16,7 @@ USER_AGENT = (
     "Chrome/131.0.0.0 Safari/537.36"
 )
 
-# Headers which belong to the connection between client and proxy,
-# rather than the upstream server.
+# Headers that should not be copied from the upstream server.
 HOP_BY_HOP = {
     "connection",
     "keep-alive",
@@ -28,9 +27,10 @@ HOP_BY_HOP = {
     "transfer-encoding",
     "upgrade",
     "content-length",
+    "content-encoding",
 }
 
-# Headers that can prevent proxied pages from loading.
+# Headers that can interfere with displaying proxied pages.
 STRIP_RESPONSE_HEADERS = {
     "content-security-policy",
     "content-security-policy-report-only",
@@ -38,11 +38,16 @@ STRIP_RESPONSE_HEADERS = {
 }
 
 
-# ---------------------------------------------------------
+# =========================================================
 # SECURITY
-# ---------------------------------------------------------
+# =========================================================
 
 def is_public_host(host):
+    """
+    Prevent the proxy from connecting to private/local
+    addresses.
+    """
+
     if not host:
         return False
 
@@ -54,7 +59,9 @@ def is_public_host(host):
         )
 
         for address in addresses:
-            ip = ipaddress.ip_address(address[4][0])
+            ip = ipaddress.ip_address(
+                address[4][0]
+            )
 
             if (
                 ip.is_private
@@ -76,53 +83,83 @@ def normalize_url(url):
     url = (url or "").strip()
 
     if not url:
-        raise ValueError("No URL was provided.")
+        raise ValueError(
+            "No URL was provided."
+        )
 
-    if not re.match(r"^https?://", url, re.IGNORECASE):
+    # Allow:
+    # example.com
+    # www.example.com
+    #
+    # without requiring https://
+    if not re.match(
+        r"^https?://",
+        url,
+        re.IGNORECASE,
+    ):
         url = "https://" + url
 
     parsed = urlparse(url)
 
-    if parsed.scheme.lower() not in ("http", "https"):
+    if parsed.scheme.lower() not in (
+        "http",
+        "https",
+    ):
         raise ValueError(
             "Only HTTP and HTTPS URLs are supported."
         )
 
     if not parsed.hostname:
-        raise ValueError("Invalid URL.")
+        raise ValueError(
+            "Invalid URL."
+        )
 
-    if not is_public_host(parsed.hostname):
-        raise ValueError("That host is not allowed.")
+    if not is_public_host(
+        parsed.hostname
+    ):
+        raise ValueError(
+            "That host is not allowed."
+        )
 
     return url
 
 
 def proxy_url(url):
-    return "/proxy?url=" + quote(url, safe="")
+    return (
+        "/proxy?url="
+        + quote(url, safe="")
+    )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # REQUEST HEADERS
-# ---------------------------------------------------------
+# =========================================================
 
 def build_upstream_headers():
+
     headers = {
         "User-Agent": USER_AGENT,
+
         "Accept": request.headers.get(
             "Accept",
             "*/*",
         ),
+
         "Accept-Language": request.headers.get(
             "Accept-Language",
             "en-US,en;q=0.9",
         ),
 
-        # Let requests handle compression.
-        "Accept-Encoding": "gzip, deflate, br",
+        # IMPORTANT:
+        #
+        # Don't request gzip/Brotli from the destination.
+        # This prevents compressed bytes from accidentally
+        # being sent to the browser as plain text.
+        "Accept-Encoding": "identity",
     }
 
-    # Forward useful browser headers.
-    forward = [
+    # Useful browser headers.
+    forward_headers = [
         "Referer",
         "Origin",
         "Authorization",
@@ -136,23 +173,39 @@ def build_upstream_headers():
         "Sec-Fetch-User",
     ]
 
-    for name in forward:
-        value = request.headers.get(name)
+    for name in forward_headers:
+
+        value = request.headers.get(
+            name
+        )
 
         if value:
             headers[name] = value
 
-    content_type = request.headers.get("Content-Type")
+    # Forward cookies.
+    cookie = request.headers.get(
+        "Cookie"
+    )
+
+    if cookie:
+        headers["Cookie"] = cookie
+
+    # Forward content type for POST/PUT/etc.
+    content_type = request.headers.get(
+        "Content-Type"
+    )
 
     if content_type:
-        headers["Content-Type"] = content_type
+        headers["Content-Type"] = (
+            content_type
+        )
 
     return headers
 
 
-# ---------------------------------------------------------
-# HTML / CSS REWRITING
-# ---------------------------------------------------------
+# =========================================================
+# URL REWRITING
+# =========================================================
 
 URL_ATTRIBUTES = re.compile(
     r'(?P<prefix>\b'
@@ -167,12 +220,17 @@ URL_ATTRIBUTES = re.compile(
 )
 
 
-def rewrite_one_url(original, base_url):
+def rewrite_one_url(
+    original,
+    base_url,
+):
+
     original = original.strip()
 
     if not original:
         return None
 
+    # Things that shouldn't be proxied.
     if original.startswith(
         (
             "#",
@@ -185,21 +243,38 @@ def rewrite_one_url(original, base_url):
     ):
         return None
 
-    absolute = urljoin(base_url, original)
+    absolute = urljoin(
+        base_url,
+        original,
+    )
 
     try:
-        absolute = normalize_url(absolute)
+        absolute = normalize_url(
+            absolute
+        )
+
     except ValueError:
         return None
 
-    return proxy_url(absolute)
+    return proxy_url(
+        absolute
+    )
 
 
-def rewrite_html(html, base_url):
+def rewrite_html(
+    html,
+    base_url,
+):
 
-    # href/src/action/etc.
+    # -----------------------------------------------------
+    # href / src / action / etc.
+    # -----------------------------------------------------
+
     def replace_attribute(match):
-        original = match.group("url")
+
+        original = match.group(
+            "url"
+        )
 
         rewritten = rewrite_one_url(
             original,
@@ -221,9 +296,15 @@ def rewrite_html(html, base_url):
         html,
     )
 
+    # -----------------------------------------------------
     # CSS url(...)
+    # -----------------------------------------------------
+
     def replace_css(match):
-        original = match.group(2).strip()
+
+        original = match.group(
+            2
+        ).strip()
 
         rewritten = rewrite_one_url(
             original,
@@ -233,7 +314,11 @@ def rewrite_html(html, base_url):
         if rewritten is None:
             return match.group(0)
 
-        return "url('" + rewritten + "')"
+        return (
+            "url('"
+            + rewritten
+            + "')"
+        )
 
     html = re.sub(
         r"url\(\s*(['\"]?)(.*?)\1\s*\)",
@@ -242,9 +327,15 @@ def rewrite_html(html, base_url):
         flags=re.IGNORECASE,
     )
 
+    # -----------------------------------------------------
     # <base href="">
+    # -----------------------------------------------------
+
     def replace_base(match):
-        original = match.group(3)
+
+        original = match.group(
+            3
+        )
 
         rewritten = rewrite_one_url(
             original,
@@ -266,11 +357,14 @@ def rewrite_html(html, base_url):
         r'(["\'])(.*?)(\2)',
         replace_base,
         html,
-        flags=re.IGNORECASE | re.DOTALL,
+        flags=(
+            re.IGNORECASE
+            | re.DOTALL
+        ),
     )
 
     # -----------------------------------------------------
-    # Browser bridge
+    # JavaScript bridge
     # -----------------------------------------------------
 
     bridge = f"""
@@ -279,9 +373,14 @@ window.__PROXY_BASE__ = {base_url!r};
 window.__PROXY_PREFIX__ = "/proxy?url=";
 
 (function () {{
+
     function proxyURL(value) {{
+
         try {{
-            if (!value) return value;
+
+            if (!value) {{
+                return value;
+            }}
 
             if (
                 /^(javascript:|data:|mailto:|tel:|blob:|#)/i
@@ -297,52 +396,79 @@ window.__PROXY_PREFIX__ = "/proxy?url=";
                 ).href;
 
             return (
-                window.__PROXY_PREFIX__ +
-                encodeURIComponent(absolute)
+                window.__PROXY_PREFIX__
+                + encodeURIComponent(
+                    absolute
+                )
             );
+
         }} catch (e) {{
+
             return value;
+
         }}
     }}
 
-    // window.open
-    const originalOpen = window.open;
 
-    window.open = function(url, target, features) {{
+    // -------------------------------------------------
+    // window.open
+    // -------------------------------------------------
+
+    const originalOpen =
+        window.open;
+
+    window.open = function(
+        url,
+        target,
+        features
+    ) {{
+
         return originalOpen.call(
             window,
             proxyURL(url),
             target,
             features
         );
+
     }};
 
-    // Location navigation
-    try {{
-        const originalAssign =
-            window.location.assign.bind(window.location);
 
-        window.location.assign = function(url) {{
-            originalAssign(proxyURL(url));
-        }};
-    }} catch (e) {{}}
+    // -------------------------------------------------
+    // fetch()
+    // -------------------------------------------------
 
-    // Fetch
-    const originalFetch = window.fetch;
+    const originalFetch =
+        window.fetch;
 
-    window.fetch = function(input, init) {{
+    window.fetch = function(
+        input,
+        init
+    ) {{
+
         try {{
-            if (typeof input === "string") {{
-                input = proxyURL(input);
+
+            if (
+                typeof input === "string"
+            ) {{
+
+                input = proxyURL(
+                    input
+                );
+
             }} else if (
                 input &&
                 input.url
             ) {{
+
                 input = new Request(
-                    proxyURL(input.url),
+                    proxyURL(
+                        input.url
+                    ),
                     input
                 );
+
             }}
+
         }} catch (e) {{}}
 
         return originalFetch.call(
@@ -352,25 +478,43 @@ window.__PROXY_PREFIX__ = "/proxy?url=";
         );
     }};
 
+
+    // -------------------------------------------------
     // XMLHttpRequest
-    const originalOpenXHR =
-        XMLHttpRequest.prototype.open;
+    // -------------------------------------------------
+
+    const originalXHRopen =
+        XMLHttpRequest
+            .prototype
+            .open;
 
     XMLHttpRequest.prototype.open =
-        function(method, url) {{
+        function(
+            method,
+            url
+        ) {{
 
-            arguments[1] = proxyURL(url);
+            arguments[1] =
+                proxyURL(url);
 
-            return originalOpenXHR.apply(
+            return originalXHRopen.apply(
                 this,
                 arguments
             );
+
         }};
+
 }})();
 </script>
 """
 
-    if re.search(r"</head\s*>", html, re.IGNORECASE):
+    # Put bridge into <head>.
+    if re.search(
+        r"</head\s*>",
+        html,
+        re.IGNORECASE,
+    ):
+
         html = re.sub(
             r"</head\s*>",
             bridge + "</head>",
@@ -378,31 +522,46 @@ window.__PROXY_PREFIX__ = "/proxy?url=";
             count=1,
             flags=re.IGNORECASE,
         )
+
     else:
-        html = bridge + html
+
+        html = (
+            bridge
+            + html
+        )
 
     return html
 
 
-# ---------------------------------------------------------
+# =========================================================
 # RESPONSE HEADERS
-# ---------------------------------------------------------
+# =========================================================
 
-def build_response_headers(upstream):
+def build_response_headers(
+    upstream
+):
+
     output = {}
 
-    for key, value in upstream.headers.items():
+    for key, value in (
+        upstream.headers.items()
+    ):
+
         lower = key.lower()
 
         if lower in HOP_BY_HOP:
             continue
 
-        if lower in STRIP_RESPONSE_HEADERS:
+        if (
+            lower
+            in STRIP_RESPONSE_HEADERS
+        ):
             continue
 
-        # requests can receive upstream cookies containing
-        # Domain/Path attributes intended for another host.
+        # Remove the upstream cookie domain so
+        # the browser can store it for the proxy.
         if lower == "set-cookie":
+
             value = re.sub(
                 r";\s*domain=[^;]+",
                 "",
@@ -410,31 +569,58 @@ def build_response_headers(upstream):
                 flags=re.IGNORECASE,
             )
 
-            value = re.sub(
-                r";\s*path=/",
-                "; Path=/",
-                value,
-                flags=re.IGNORECASE,
-            )
-
         output[key] = value
+
+    # CRITICAL:
+    #
+    # We requested identity encoding.
+    # Remove these headers regardless so that the browser
+    # never attempts to decode data using an upstream
+    # compression format.
+    output.pop(
+        "Content-Encoding",
+        None,
+    )
+
+    output.pop(
+        "Content-Length",
+        None,
+    )
 
     return output
 
 
-# ---------------------------------------------------------
+# =========================================================
 # PROXY
-# ---------------------------------------------------------
+# =========================================================
 
-@app.route("/proxy", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+@app.route(
+    "/proxy",
+    methods=[
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+    ],
+)
 def proxy():
 
+    # -----------------------------------------------------
+    # Validate URL
+    # -----------------------------------------------------
+
     try:
+
         target = normalize_url(
-            request.args.get("url", "")
+            request.args.get(
+                "url",
+                "",
+            )
         )
 
     except ValueError as error:
+
         return (
             render_template(
                 "error.html",
@@ -443,10 +629,17 @@ def proxy():
             400,
         )
 
-    try:
-        headers = build_upstream_headers()
+    # -----------------------------------------------------
+    # Fetch upstream
+    # -----------------------------------------------------
 
-        body = None
+    try:
+
+        headers = (
+            build_upstream_headers()
+        )
+
+        request_body = None
 
         if request.method in {
             "POST",
@@ -454,42 +647,53 @@ def proxy():
             "PATCH",
             "DELETE",
         }:
-            body = request.get_data()
 
-        # Forward the browser's cookies.
-        if request.headers.get("Cookie"):
-            headers["Cookie"] = request.headers["Cookie"]
+            request_body = (
+                request.get_data()
+            )
 
         upstream = requests.request(
             method=request.method,
             url=target,
             headers=headers,
-            data=body,
+            data=request_body,
             timeout=TIMEOUT,
             allow_redirects=False,
             stream=True,
         )
 
         # -------------------------------------------------
-        # Redirect
+        # Redirects
         # -------------------------------------------------
 
         if (
             300 <= upstream.status_code < 400
-            and upstream.headers.get("Location")
+            and upstream.headers.get(
+                "Location"
+            )
         ):
+
             destination = urljoin(
                 upstream.url,
-                upstream.headers["Location"],
+                upstream.headers[
+                    "Location"
+                ],
             )
 
             try:
-                destination = normalize_url(
-                    destination
+
+                destination = (
+                    normalize_url(
+                        destination
+                    )
                 )
 
+                upstream.close()
+
                 return redirect(
-                    proxy_url(destination),
+                    proxy_url(
+                        destination
+                    ),
                     code=upstream.status_code,
                 )
 
@@ -497,24 +701,34 @@ def proxy():
                 pass
 
         # -------------------------------------------------
-        # Read response
+        # Content type
         # -------------------------------------------------
 
-        content_type = upstream.headers.get(
-            "Content-Type",
-            "",
+        content_type = (
+            upstream.headers.get(
+                "Content-Type",
+                "",
+            )
         )
 
-        # For now HTML is buffered because it needs rewriting.
-        if "text/html" in content_type.lower():
+        # -------------------------------------------------
+        # HTML
+        # -------------------------------------------------
+
+        if (
+            "text/html"
+            in content_type.lower()
+        ):
 
             body = upstream.content
 
             if len(body) > MAX_BYTES:
+
                 upstream.close()
 
                 return (
-                    "The destination response is too large.",
+                    "The destination response "
+                    "is too large.",
                     413,
                 )
 
@@ -533,24 +747,21 @@ def proxy():
                 upstream.url,
             )
 
-            body = html.encode("utf-8")
-
-            output_headers = build_response_headers(
-                upstream
+            body = html.encode(
+                "utf-8"
             )
 
-            output_headers["Content-Type"] = (
-                "text/html; charset=utf-8"
+            output_headers = (
+                build_response_headers(
+                    upstream
+                )
             )
 
-            output_headers.pop(
-                "Content-Encoding",
-                None,
-            )
-
-            output_headers.pop(
-                "Content-Length",
-                None,
+            output_headers[
+                "Content-Type"
+            ] = (
+                "text/html; "
+                "charset=utf-8"
             )
 
             upstream.close()
@@ -562,35 +773,39 @@ def proxy():
             )
 
         # -------------------------------------------------
-        # Everything else
+        # Non-HTML
         #
-        # Images, video, JS, CSS, fonts, JSON, API
-        # responses, etc.
+        # Images
+        # CSS
+        # JavaScript
+        # JSON
+        # Fonts
+        # Video
+        # etc.
         # -------------------------------------------------
 
-        data = upstream.content
+        body = upstream.content
 
-        if len(data) > MAX_BYTES:
+        if len(body) > MAX_BYTES:
+
             upstream.close()
 
             return (
-                "The destination response is too large.",
+                "The destination response "
+                "is too large.",
                 413,
             )
 
-        output_headers = build_response_headers(
-            upstream
-        )
-
-        output_headers.pop(
-            "Content-Length",
-            None,
+        output_headers = (
+            build_response_headers(
+                upstream
+            )
         )
 
         upstream.close()
 
         return Response(
-            data,
+            body,
             status=upstream.status_code,
             headers=output_headers,
         )
@@ -601,7 +816,8 @@ def proxy():
             render_template(
                 "error.html",
                 message=(
-                    "The proxy could not fetch that page: "
+                    "The proxy could not fetch "
+                    "that page: "
                     + str(error)
                 ),
             ),
@@ -609,16 +825,24 @@ def proxy():
         )
 
 
-# ---------------------------------------------------------
-# HOME
-# ---------------------------------------------------------
+# =========================================================
+# HOME PAGE
+# =========================================================
 
 @app.get("/")
 def index():
-    return render_template("index.html")
 
+    return render_template(
+        "index.html"
+    )
+
+
+# =========================================================
+# START SERVER
+# =========================================================
 
 if __name__ == "__main__":
+
     app.run(
         host="0.0.0.0",
         port=5000,
